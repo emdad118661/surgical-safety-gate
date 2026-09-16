@@ -1,7 +1,9 @@
 
+// client/src/app/dashboard/page.js
 "use client";
 import { useEffect, useState } from 'react';
 import FHIR from 'fhirclient';
+import { useRouter } from 'next/navigation';
 import Swal from 'sweetalert2';
 
 export default function Dashboard() {
@@ -9,29 +11,78 @@ export default function Dashboard() {
     const [allergies, setAllergies] = useState([]);
     const [labs, setLabs] = useState([]);
     const [loading, setLoading] = useState(true);
+    const [authError, setAuthError] = useState(false); // নতুন স্টেট যোগ করুন
+    const router = useRouter();
 
     useEffect(() => {
         FHIR.oauth2.ready()
             .then(async (client) => {
-                // 1. Retrieving patient data
+                // চেক করুন ক্লায়েন্ট বা পেশেন্ট আইডি আছে কি না
+                if (!client || !client.patient || !client.patient.id) {
+                    console.warn("Patient context lost.");
+                    setAuthError(true); // রিডাইরেক্ট না করে এরর স্টেট সেট করুন
+                    setLoading(false);
+                    return;
+                }
+
+                // ১. পেশেন্ট ডাটা আনা
                 const patientData = await client.patient.read();
                 setPatient(patientData);
 
-                // 2. Fetching allergy data (AllergyIntolerance Specification)
+                // ২. অ্যালার্জি ডাটা আনা
                 const allergyData = await client.request(`AllergyIntolerance?patient=${client.patient.id}`);
                 setAllergies(allergyData.entry || []);
 
-                // 3. Bringing the lab report (Observation Specification - Platelet Count LOINC: 777-3)
+                // ৩. ল্যাব রিপোর্ট আনা (Platelet Count LOINC: 777-3)
                 const labData = await client.request(`Observation?patient=${client.patient.id}&code=777-3`);
                 setLabs(labData.entry || []);
 
                 setLoading(false);
             })
-            .catch(err => console.error(err));
-    }, []);
+            .catch(err => {
+                console.error("FHIR Auth Error:", err);
+                setAuthError(true); // রিডাইরেক্ট না করে এরর স্টেট সেট করুন
+                setLoading(false);
+            });
+    }, []); // Router ডিপেন্ডেন্সি রিমুভ করুন
 
-    if (loading) return <div className="p-10 text-center">Checking Clinical Records...</div>;
+    // লোডিং স্টেট
+    if (loading) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-slate-50">
+                <div className="text-center">
+                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
+                    <p className="text-blue-600 font-semibold">Loading Patient Data...</p>
+                </div>
+            </div>
+        );
+    }
 
+    // অথরাইজেশন এরর হলে এই স্ক্রিন দেখাবে (লুপ বন্ধ করবে)
+    if (authError || !patient) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-slate-50">
+                <div className="text-center bg-white p-8 rounded-xl shadow-lg">
+                    <h2 className="text-2xl font-bold text-red-600 mb-4">Session Expired</h2>
+                    <p className="text-slate-600 mb-6">Your FHIR session has expired or is invalid.</p>
+                    <button
+                        onClick={() => window.location.href = '/launch'}
+                        className="bg-blue-600 text-white px-6 py-3 rounded-lg font-bold hover:bg-blue-700"
+                    >
+                        Relaunch App
+                    </button>
+                    <button
+                        onClick={() => window.open('https://launch.smarthealthit.org/', '_blank')}
+                        className="ml-4 bg-slate-200 text-slate-700 px-6 py-3 rounded-lg font-bold hover:bg-slate-300"
+                    >
+                        Open SMART Launcher
+                    </button>
+                </div>
+            </div>
+        );
+    }
+
+    // ... (বাকি কোড এবং JSX একই থাকবে)
 
     const handleVerify = async () => {
         // 1. Fancy prompt or confirmation (optional but looks professional)
@@ -98,11 +149,29 @@ export default function Dashboard() {
         }
     };
 
+    const handleRelaunch = () => {
+    if (window.confirm("Are you sure you want to select a new patient? Current session will be reset.")) {
+        // শুধু FHIR টোকেন ক্লিয়ার করুন
+        window.localStorage.removeItem('fhirjs');
+        window.sessionStorage.removeItem('fhirjs');
+        
+        // পুরো পেজ রিলোড দিন (এটি Next.js রাউটারের চেয়ে বেশি কার্যকর)
+        window.location.href = '/launch';
+    }
+};
+
     return (
         <div className="p-8 max-w-5xl mx-auto bg-slate-50 min-h-screen">
             <h1 className="text-3xl font-bold mb-8 text-blue-900 border-b pb-4">
                 Pre-Surgical Safety Gate
             </h1>
+
+            <button
+                onClick={handleRelaunch}
+                className="mt-6 text-sm text-red-600 hover:text-red-800 underline"
+            >
+                Logout / Select New Patient
+            </button>
 
             {/* Patient Card */}
             <div className="bg-white p-6 rounded-xl shadow-sm mb-6 border border-slate-200">
