@@ -1,0 +1,21 @@
+# Dependency folders
+node_modules/
+client/node_modules/
+server/node_modules/
+
+# Environment files (Security)
+.env
+server/.env
+client/.env
+
+# Next.js build output
+.next/
+client/.next/
+
+# Production build
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
