@@ -30,6 +30,16 @@ const auditLogSchema = new mongoose.Schema({
     hasAllergies: Boolean,
     allergyList: [String]
   },
+  // --- New: Task 2 (CPT vs SNOMED procedure/diagnosis verification) ---
+  procedureVerification: {
+    status: { type: String, default: 'not-checked' }, // match | mismatch | unmapped | insufficient-data | not-checked
+    diagnosisText: String,
+    diagnosisCode: String,
+    procedureText: String,
+    procedureCode: String
+  },
+  // --- New: Task 4 (USCDI document export tracking) ---
+  uscdiDocumentExported: { type: Boolean, default: false },
   checklistStatus: { type: String, default: "Completed" }
 });
 
@@ -51,7 +61,9 @@ app.post('/api/audit', async (req, res) => {
       plateletCount, 
       isPlateletSafe, 
       hasAllergies, 
-      allergyList 
+      allergyList,
+      procedureVerification,
+      uscdiDocumentExported
     } = req.body;
 
     const newAuditEntry = new AuditLog({
@@ -63,7 +75,9 @@ app.post('/api/audit', async (req, res) => {
         isPlateletSafe,
         hasAllergies,
         allergyList
-      }
+      },
+      procedureVerification: procedureVerification || undefined,
+      uscdiDocumentExported: !!uscdiDocumentExported
     });
 
     const savedLog = await newAuditEntry.save();

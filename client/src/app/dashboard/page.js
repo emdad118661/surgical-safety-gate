@@ -1,4 +1,3 @@
-
 // client/src/app/dashboard/page.js
 "use client";
 import { useEffect, useState } from 'react';
@@ -6,12 +5,144 @@ import FHIR from 'fhirclient';
 import { useRouter } from 'next/navigation';
 import Swal from 'sweetalert2';
 
+// ============================================================
+// TASK 2: Verify Diagnosis and Surgery (CPT vs SNOMED CT)
+// ============================================================
+// NOTE: This is a small, illustrative CPT <-> SNOMED crosswalk for demo
+// purposes only, keyed by actual code values (not display text). A
+// production system would call a licensed terminology/crosswalk service
+// (e.g. a UMLS-backed CPT-SNOMED crosswalk) instead of a hardcoded table,
+// and these example SNOMED codes should be re-verified against a live
+// terminology server (e.g. the SNOMED CT Browser) before real use.
+const CPT_SNOMED_CROSSWALK = [
+    { cptCode: "47562", cptLabel: "Laparoscopic Cholecystectomy", expectedSnomedCodes: ["235919008"] }, // Cholelithiasis
+    { cptCode: "44970", cptLabel: "Laparoscopic Appendectomy", expectedSnomedCodes: ["74400008"] }, // Acute appendicitis
+    { cptCode: "27447", cptLabel: "Total Knee Arthroplasty", expectedSnomedCodes: ["239873007"] }, // Osteoarthritis of knee
+    { cptCode: "33533", cptLabel: "Coronary Artery Bypass Graft", expectedSnomedCodes: ["53741008"] }, // Coronary arteriosclerosis
+    { cptCode: "19303", cptLabel: "Mastectomy", expectedSnomedCodes: ["254837009"] }, // Malignant neoplasm of breast
+    { cptCode: "43775", cptLabel: "Laparoscopic Sleeve Gastrectomy", expectedSnomedCodes: ["414915002", "238136002"] }, // Obesity / morbid obesity
+    { cptCode: "63030", cptLabel: "Lumbar Discectomy", expectedSnomedCodes: ["202968009"] }, // Displacement of lumbar intervertebral disc
+    { cptCode: "66984", cptLabel: "Cataract Surgery", expectedSnomedCodes: ["193570009"] }, // Age-related cataract
+];
+
+// Compares the scheduled procedure's CPT code against the patient's diagnosis
+// SNOMED CT code (not display text) and returns a verification status:
+// match | mismatch | unmapped | insufficient-data
+function verifyProcedureAgainstDiagnosis(procedureCode, diagnosisCode) {
+    if (!procedureCode || !diagnosisCode) {
+        return { status: "insufficient-data", crosswalkEntry: null };
+    }
+
+    const crosswalkEntry = CPT_SNOMED_CROSSWALK.find(row => row.cptCode === procedureCode);
+
+    if (!crosswalkEntry) {
+        return { status: "unmapped", crosswalkEntry: null };
+    }
+
+    const diagnosisMatches = crosswalkEntry.expectedSnomedCodes.includes(diagnosisCode);
+    return { status: diagnosisMatches ? "match" : "mismatch", crosswalkEntry };
+}
+
+// Extracts a code from a CodeableConcept ONLY if it's coded under one of the
+// expected terminology systems (e.g. SNOMED CT, CPT). Unlike a naive
+// "take coding[0]" fallback, this never silently mislabels a code from a
+// different system (e.g. showing a SNOMED code as if it were CPT) --
+// if no coding matches the expected system, `code` comes back null and the
+// UI shows that explicitly instead of a misleading value.
+function getCodedValue(codeableConcept, systemUrlHints) {
+    if (!codeableConcept) return { code: null, text: "", matchedSystem: null };
+    const text = codeableConcept.text || codeableConcept.coding?.[0]?.display || "";
+    const coding = codeableConcept.coding?.find(c =>
+        systemUrlHints.some(hint => c.system?.toLowerCase().includes(hint))
+    );
+    return {
+        code: coding?.code || null,
+        text,
+        matchedSystem: coding?.system || null,
+    };
+}
+
+const SNOMED_SYSTEM_HINTS = ["snomed.info/sct", "snomed"];
+const CPT_SYSTEM_HINTS = ["ama-assn.org/go/cpt", "cpt"];
+
+
+// ============================================================
+// TASK 4: Standardized Document Export (USCDI via FHIR Document Bundle)
+// ============================================================
+// Packages the verified pre-op checklist into a FHIR "document" Bundle
+// containing a Composition (the clinical note) plus the underlying
+// resources for each required USCDI data class used by this app:
+// Patient, AllergyIntolerance, Laboratory (Observation), Problems (Condition),
+// Procedures. Ref: HealthIT.gov USCDI data classes.
+function buildUscdiDocument({ patient, allergies, labs, conditions, procedures, verifiedBy, safetyStatus }) {
+    const now = new Date().toISOString();
+    const compositionId = `pre-op-summary-${patient.id}-${Date.now()}`;
+
+    const composition = {
+        resourceType: "Composition",
+        id: compositionId,
+        status: "final",
+        type: {
+            coding: [{ system: "http://loinc.org", code: "11504-8", display: "Surgical operation note" }],
+        },
+        subject: { reference: `Patient/${patient.id}` },
+        date: now,
+        author: [{ display: verifiedBy || "Unverified Provider" }],
+        title: "Pre-Surgical Safety Gate Summary",
+        section: [
+            {
+                title: "Allergies and Intolerances",
+                code: { coding: [{ system: "http://loinc.org", code: "48765-2" }] },
+                entry: allergies.map(a => ({ reference: `AllergyIntolerance/${a.resource.id}` })),
+            },
+            {
+                title: "Laboratory Results",
+                code: { coding: [{ system: "http://loinc.org", code: "30954-2" }] },
+                entry: labs.map(l => ({ reference: `Observation/${l.resource.id}` })),
+            },
+            {
+                title: "Problems / Conditions",
+                code: { coding: [{ system: "http://loinc.org", code: "11450-4" }] },
+                entry: conditions.map(c => ({ reference: `Condition/${c.resource.id}` })),
+            },
+            {
+                title: "Procedures",
+                code: { coding: [{ system: "http://loinc.org", code: "47519-4" }] },
+                entry: procedures.map(p => ({ reference: `Procedure/${p.resource.id}` })),
+            },
+            {
+                title: "Safety Gate Result",
+                code: { coding: [{ system: "http://loinc.org", code: "72133-2", display: "Assessment note" }] },
+                text: { status: "generated", div: `<div xmlns="http://www.w3.org/1999/xhtml">${safetyStatus}</div>` },
+            },
+        ],
+    };
+
+    return {
+        resourceType: "Bundle",
+        type: "document",
+        identifier: { system: "urn:dna-health:pre-op-summary", value: compositionId },
+        timestamp: now,
+        entry: [
+            { resource: composition },
+            { resource: patient },
+            ...allergies.map(a => ({ resource: a.resource })),
+            ...labs.map(l => ({ resource: l.resource })),
+            ...conditions.map(c => ({ resource: c.resource })),
+            ...procedures.map(p => ({ resource: p.resource })),
+        ],
+    };
+}
+
 export default function Dashboard() {
     const [patient, setPatient] = useState(null);
     const [allergies, setAllergies] = useState([]);
     const [labs, setLabs] = useState([]);
+    const [conditions, setConditions] = useState([]); // Task 2: diagnosis (SNOMED)
+    const [procedures, setProcedures] = useState([]); // Task 2: scheduled surgery (CPT)
     const [loading, setLoading] = useState(true);
     const [authError, setAuthError] = useState(false); // নতুন স্টেট যোগ করুন
+    const [uscdiExported, setUscdiExported] = useState(false); // Task 4: tracks whether the USCDI doc was actually downloaded
     const router = useRouter();
 
     useEffect(() => {
@@ -36,6 +167,24 @@ export default function Dashboard() {
                 // ৩. ল্যাব রিপোর্ট আনা (Platelet Count LOINC: 777-3)
                 const labData = await client.request(`Observation?patient=${client.patient.id}&code=777-3`);
                 setLabs(labData.entry || []);
+
+                // ৪. [Task 2] ডায়াগনসিস (Condition, SNOMED CT) আনা
+                try {
+                    const conditionData = await client.request(`Condition?patient=${client.patient.id}`);
+                    setConditions(conditionData.entry || []);
+                } catch (e) {
+                    console.warn("Condition fetch failed (sandbox may not have data for this patient):", e);
+                    setConditions([]);
+                }
+
+                // ৫. [Task 2] শিডিউলড সার্জারি (Procedure, CPT) আনা
+                try {
+                    const procedureData = await client.request(`Procedure?patient=${client.patient.id}`);
+                    setProcedures(procedureData.entry || []);
+                } catch (e) {
+                    console.warn("Procedure fetch failed (sandbox may not have data for this patient):", e);
+                    setProcedures([]);
+                }
 
                 setLoading(false);
             })
@@ -84,6 +233,48 @@ export default function Dashboard() {
 
     // ... (বাকি কোড এবং JSX একই থাকবে)
 
+    // [Task 2] প্রথম Condition ও Procedure রিসোর্স থেকে ডায়াগনসিস/প্রসিডিউর বের করা
+    const primaryCondition = conditions[0]?.resource;
+    const primaryProcedure = procedures[0]?.resource;
+    const diagnosisInfo = getCodedValue(primaryCondition?.code, SNOMED_SYSTEM_HINTS);
+    const procedureInfo = getCodedValue(primaryProcedure?.code, CPT_SYSTEM_HINTS);
+    const procedureVerification = verifyProcedureAgainstDiagnosis(procedureInfo.code, diagnosisInfo.code);
+
+    // [Task 4] USCDI ডকুমেন্ট এক্সপোর্ট করা (JSON ফাইল ডাউনলোড)
+    const handleExportUscdiDocument = () => {
+        const plateletVal = labs[0]?.resource?.valueQuantity?.value;
+        const safetyStatus = (plateletVal > 150 && allergies.length === 0) ? "Safe for Surgery" : "Requires Review";
+
+        const uscdiDoc = buildUscdiDocument({
+            patient,
+            allergies,
+            labs,
+            conditions,
+            procedures,
+            verifiedBy: "Dr. Albertine Orn", // TODO: replace with real fhirUser once SMART identity claim is wired in
+            safetyStatus,
+        });
+
+        const blob = new Blob([JSON.stringify(uscdiDoc, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `pre-op-summary-${patient.id}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        setUscdiExported(true); // mark as exported so the audit payload reflects reality
+
+        Swal.fire({
+            icon: "success",
+            title: "USCDI Document Exported",
+            html: `A FHIR Document Bundle (Composition) with the required USCDI data classes<br/>(demographics, allergies, labs, problems, procedures) has been downloaded.`,
+            confirmButtonColor: "#2563eb",
+        });
+    };
+
     const handleVerify = async () => {
         // 1. Fancy prompt or confirmation (optional but looks professional)
         const confirm = await Swal.fire({
@@ -114,7 +305,17 @@ export default function Dashboard() {
             plateletCount: labs[0]?.resource?.valueQuantity?.value || 0,
             isPlateletSafe: labs[0]?.resource?.valueQuantity?.value > 150,
             hasAllergies: allergies.length > 0,
-            allergyList: allergies.map(a => a.resource.code.text || "Unknown")
+            allergyList: allergies.map(a => a.resource.code.text || "Unknown"),
+            // [Task 2] CPT vs SNOMED procedure/diagnosis verification result
+            procedureVerification: {
+                status: procedureVerification.status,
+                diagnosisText: diagnosisInfo.text,
+                diagnosisCode: diagnosisInfo.code,
+                procedureText: procedureInfo.text,
+                procedureCode: procedureInfo.code,
+            },
+            // [Task 4] whether a USCDI document had already been exported this session
+            uscdiDocumentExported: uscdiExported
         };
 
         try {
@@ -221,8 +422,58 @@ export default function Dashboard() {
                 </div>
             </div>
 
-            {/* Action Button */}
-            <div className="mt-10 text-right">
+            {/* [Task 2] Procedure Verification: CPT (scheduled surgery) vs SNOMED CT (diagnosis) */}
+            <div className={`mt-6 p-6 rounded-xl shadow-sm border ${
+                procedureVerification.status === "match" ? "bg-green-50 border-green-200"
+                : procedureVerification.status === "mismatch" ? "bg-red-50 border-red-200"
+                : "bg-amber-50 border-amber-200"
+            }`}>
+                <h3 className="text-xl font-bold mb-4">Procedure Verification (CPT vs SNOMED CT)</h3>
+                <div className="grid grid-cols-2 gap-6 mb-4">
+                    <div>
+                        <p className="text-sm text-slate-400">Diagnosis (SNOMED CT)</p>
+                        <p className="font-semibold">{diagnosisInfo.text || "Not found in FHIR record"}</p>
+                        {diagnosisInfo.code
+                            ? <p className="text-xs text-slate-400">Code: {diagnosisInfo.code}</p>
+                            : diagnosisInfo.text && <p className="text-xs text-amber-600 italic">Not coded with SNOMED CT in this record</p>
+                        }
+                    </div>
+                    <div>
+                        <p className="text-sm text-slate-400">Scheduled Procedure (CPT)</p>
+                        <p className="font-semibold">{procedureInfo.text || "Not found in FHIR record"}</p>
+                        {procedureInfo.code
+                            ? <p className="text-xs text-slate-400">Code: {procedureInfo.code}</p>
+                            : procedureInfo.text && <p className="text-xs text-amber-600 italic">Not coded with CPT in this record</p>
+                        }
+                    </div>
+                </div>
+                {procedureVerification.status === "match" && (
+                    <p className="text-green-700 font-bold">✓ Procedure matches diagnosis (crosswalk verified)</p>
+                )}
+                {procedureVerification.status === "mismatch" && (
+                    <p className="text-red-700 font-bold">✕ Procedure does NOT match diagnosis &mdash; manual review required</p>
+                )}
+                {procedureVerification.status === "unmapped" && (
+                    <p className="text-amber-700 font-bold">⚠ No crosswalk entry for this procedure &mdash; manual review required (demo crosswalk covers a limited set of procedures)</p>
+                )}
+                {procedureVerification.status === "insufficient-data" && (
+                    <p className="text-amber-700 font-bold">
+                        ⚠ {(!diagnosisInfo.text || !procedureInfo.text)
+                            ? "Diagnosis or procedure data not available in this FHIR sandbox for this patient"
+                            : "Diagnosis and/or procedure name found, but not coded with the expected SNOMED CT / CPT terminology system in this record"}
+                        {" "}&mdash; manual review required
+                    </p>
+                )}
+            </div>
+
+            {/* Action Buttons */}
+            <div className="mt-10 flex justify-end gap-4">
+                <button
+                    onClick={handleExportUscdiDocument} // [Task 4] USCDI document export
+                    className="bg-slate-700 text-white px-6 py-3 rounded-lg font-bold hover:bg-slate-800 shadow-lg active:transform active:scale-95 transition"
+                >
+                    Export USCDI Pre-Op Summary
+                </button>
                 <button
                     onClick={handleVerify} // এখানে ফাংশনটি কল করুন
                     className="bg-blue-600 text-white px-8 py-3 rounded-lg font-bold hover:bg-blue-700 shadow-lg active:transform active:scale-95 transition"
