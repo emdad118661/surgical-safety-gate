@@ -57,7 +57,8 @@ app.post('/api/audit', async (req, res) => {
   try {
     const { 
       patientId, 
-      patientName, 
+      patientName,
+      verifiedBy,                          // ← new
       plateletCount, 
       isPlateletSafe, 
       hasAllergies, 
@@ -69,6 +70,7 @@ app.post('/api/audit', async (req, res) => {
     const newAuditEntry = new AuditLog({
       patientId,
       patientName,
+      verifiedBy: verifiedBy || "Unknown Provider",   // ← take from body instead of default
       safetyStatus: (isPlateletSafe && !hasAllergies) ? 'Safe for Surgery' : 'Requires Review',
       clinicalData: {
         plateletCount,
